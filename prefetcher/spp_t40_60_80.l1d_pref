@@ -1,0 +1,217 @@
+#include "cache.h"
+
+#define SPP_T1 40
+#define SPP_T2 60
+#define SPP_T3 80
+#define SPP_FIXED_DEGREE 0
+#define SPP_EPOCH 64
+#define SPP_USE_RF 1
+
+#define IPT_ENTRIES 64
+#define PT_ENTRIES 256
+#define RPF_ENTRIES 128
+#define RF_ENTRIES 256
+#define SIG_MASK 0xFFF
+#define LINES_PER_PAGE (1 << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE))
+#define IPT_BITS (1 + 1 + 2 + 8 + 8 + 6 + 7 + 12)
+#define PT_BITS (7 + 2)
+#define RPF_BITS (1 + 9)
+#define RF_BITS (1 + 8)
+#define CTR_BITS (7 + 9 + 2)
+
+struct IPEntry {
+    uint8_t valid : 1;
+    uint8_t uni : 1;
+    uint8_t conf : 2;
+    uint8_t tag;
+    uint8_t page;
+    uint8_t off : 6;
+    int8_t stride : 7;
+    uint16_t sig : 12;
+};
+
+struct PTEntry {
+    int8_t stride : 7;
+    uint8_t conf : 2;
+};
+
+struct RPFEntry {
+    uint16_t valid : 1;
+    uint16_t tag : 9;
+};
+
+struct RFEntry {
+    uint16_t valid : 1;
+    uint16_t tag : 8;
+};
+
+static IPEntry spp_ipt[IPT_ENTRIES];
+static PTEntry spp_pt[PT_ENTRIES];
+static RPFEntry spp_rpf[RPF_ENTRIES];
+static RFEntry spp_rf[RF_ENTRIES];
+static uint32_t spp_fills, spp_useful, spp_degree = SPP_FIXED_DEGREE ? SPP_FIXED_DEGREE : 2;
+static uint64_t spp_degree_hist[5];
+static uint64_t spp_calls, spp_issued_total, spp_fills_total, spp_useful_total, spp_resident_skips;
+
+static inline uint32_t pt_index(uint32_t sig) { return (sig ^ (sig >> 8)) & (PT_ENTRIES - 1); }
+static inline uint32_t next_sig(uint32_t sig, int stride) { return ((sig << 3) ^ (uint32_t)(stride & 0x7F)) & SIG_MASK; }
+static inline uint8_t page_hash(uint64_t page) { return (page ^ (page >> 8) ^ (page >> 16)) & 0xFF; }
+
+static inline void rf_insert(uint64_t line)
+{
+    RFEntry &f = spp_rf[line % RF_ENTRIES];
+    f.valid = 1;
+    f.tag = (line / RF_ENTRIES) & 0xFF;
+}
+
+static inline bool rf_present(uint64_t line)
+{
+    const RFEntry &f = spp_rf[line % RF_ENTRIES];
+    return f.valid && f.tag == ((line / RF_ENTRIES) & 0xFF);
+}
+
+static inline void rf_remove(uint64_t line)
+{
+    RFEntry &f = spp_rf[line % RF_ENTRIES];
+    if (f.valid && f.tag == ((line / RF_ENTRIES) & 0xFF)) f.valid = 0;
+}
+
+static void spp_end_epoch()
+{
+#if SPP_FIXED_DEGREE
+    spp_degree = SPP_FIXED_DEGREE;
+#else
+    uint32_t u = spp_useful > spp_fills ? spp_fills : spp_useful;
+    uint32_t acc = 100 * u / spp_fills;
+    spp_degree = acc < SPP_T1 ? 1 : acc < SPP_T2 ? 2 : acc < SPP_T3 ? 3 : 4;
+#endif
+    spp_degree_hist[spp_degree]++;
+    spp_fills = spp_useful = 0;
+}
+
+static void pt_train(uint32_t sig, int stride)
+{
+    PTEntry &p = spp_pt[pt_index(sig)];
+    if (p.stride == stride) {
+        if (p.conf < 3) p.conf++;
+    } else if (p.conf) {
+        p.conf--;
+    } else {
+        p.stride = stride;
+    }
+}
+
+void CACHE::l1d_prefetcher_notify_about_dtlb_eviction(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+}
+
+void CACHE::l1d_prefetcher_initialize()
+{
+    cout << "CPU " << cpu << " L1D SPP (uniform + signature-based non-uniform stride prefetcher)" << endl;
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
+{
+    if (type == PREFETCH) return;
+
+    spp_calls++;
+    uint64_t line = addr >> LOG2_BLOCK_SIZE;
+    int off = line & (LINES_PER_PAGE - 1);
+    uint8_t ph = page_hash(addr >> LOG2_PAGE_SIZE);
+
+    RPFEntry &r = spp_rpf[line % RPF_ENTRIES];
+    if (r.valid && r.tag == ((line / RPF_ENTRIES) & 0x1FF)) {
+        spp_useful++;
+        spp_useful_total++;
+        r.valid = 0;
+    }
+    if (cache_hit) rf_insert(line);
+
+    IPEntry &e = spp_ipt[(ip ^ (ip >> 6)) & (IPT_ENTRIES - 1)];
+    uint8_t tag = (ip >> 6) & 0xFF;
+    if (!e.valid || e.tag != tag) {
+        e = IPEntry();
+        e.valid = 1;
+        e.tag = tag;
+        e.page = ph;
+        e.off = off;
+        return;
+    }
+
+    if (e.page != ph) {
+        e.page = ph;
+        e.off = off;
+    } else {
+        int stride = off - e.off;
+        if (stride == 0) return;
+
+        if (stride == e.stride) {
+            if (e.conf < 3) e.conf++;
+        } else if (e.conf) {
+            e.conf--;
+        }
+        e.stride = stride;
+        if (e.conf == 3) e.uni = 1;
+        else if (e.conf <= 1) e.uni = 0;
+
+        if (!e.uni) pt_train(e.sig, stride);
+        e.sig = next_sig(e.sig, stride);
+        e.off = off;
+    }
+
+    uint64_t page_base = (addr >> LOG2_PAGE_SIZE) << LOG2_PAGE_SIZE;
+    uint32_t degree = spp_degree;
+    int cur = off;
+    uint32_t sig = e.sig;
+
+    for (uint32_t k = 1; k <= degree; k++) {
+        int step;
+        if (e.uni) {
+            step = e.stride;
+        } else {
+            PTEntry &p = spp_pt[pt_index(sig)];
+            if (p.conf < 1) break;
+            step = p.stride;
+            sig = next_sig(sig, step);
+        }
+        cur += step;
+        if (step == 0 || cur < 0 || cur >= LINES_PER_PAGE) break;
+
+        uint64_t pf_line = (page_base >> LOG2_BLOCK_SIZE) + cur;
+#if SPP_USE_RF
+        if (rf_present(pf_line)) {
+            spp_resident_skips++;
+            continue;
+        }
+#endif
+        if (prefetch_line(ip, addr, pf_line << LOG2_BLOCK_SIZE, MSHR.occupancy < (MSHR.SIZE >> 1) ? FILL_L1 : FILL_L2, 0)) {
+            rf_insert(pf_line);
+            spp_issued_total++;
+        }
+    }
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    if (v_evicted_addr) rf_remove(v_evicted_addr >> LOG2_BLOCK_SIZE);
+    if (!v_addr) return;
+
+    uint64_t line = v_addr >> LOG2_BLOCK_SIZE;
+    rf_insert(line);
+    if (!prefetch) return;
+
+    RPFEntry &r = spp_rpf[line % RPF_ENTRIES];
+    r.valid = 1;
+    r.tag = (line / RPF_ENTRIES) & 0x1FF;
+    spp_fills_total++;
+    if (++spp_fills >= SPP_EPOCH) spp_end_epoch();
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+    uint32_t bits = IPT_ENTRIES * IPT_BITS + PT_ENTRIES * PT_BITS + RPF_ENTRIES * RPF_BITS + RF_ENTRIES * RF_BITS * SPP_USE_RF + CTR_BITS;
+    cout << "SPP storage: " << bits << " bits (" << bits / 8.0 << " bytes)" << endl;
+    cout << "SPP demand calls " << spp_calls << " issued " << spp_issued_total << " resident skips " << spp_resident_skips
+         << " prefetch fills " << spp_fills_total << " filter-useful " << spp_useful_total << endl;
+    cout << "SPP epochs at degree 1/2/3/4: " << spp_degree_hist[1] << "/" << spp_degree_hist[2] << "/" << spp_degree_hist[3] << "/" << spp_degree_hist[4] << endl;
+}
