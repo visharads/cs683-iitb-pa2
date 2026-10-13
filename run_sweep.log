@@ -1,0 +1,12 @@
+nohup: ignoring input
+== build spp_t20_40_60
+== build spp_t25_50_75
+== build spp_t30_55_75
+== build spp_t40_60_80
+== build spp_t50_70_90
+== build spp_d1
+== build spp_d2
+== build spp_d4
+== build spp_norf
+== running 27 simulations with 8 jobs
+done: results/task1_sweep
