@@ -1,0 +1,161 @@
+#include "cache.h"
+#include <random>
+#include <iostream>
+
+#define maxRRPV 3
+#define DATA_PROMOTE_PERCENT 8
+
+// 00 0011 1111 -- 16 leader sets 
+#define LEADER_SET_MASK 0x3F 
+
+#define TURN_ON_THRESH 20
+#define TURN_OFF_THRESH 15
+
+#define MISS_WEIGHT 1
+
+#define EPOCH_LIMIT 4096     
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+uint32_t instr_access_count = 0;
+uint32_t instr_miss_count = 0;
+uint32_t total_access_count = 0;
+uint32_t total_miss_count = 0;
+
+bool global_use_irrip = false;
+
+std::mt19937 irrip_rng(683);
+std::uniform_int_distribution<int> irrip_percent(0, 99);
+
+bool is_leader_set(uint32_t set) {
+    return (set & LEADER_SET_MASK) == 0;
+}
+
+void evaluate_phase() {
+    // giving more weight to misses 
+    uint32_t i_score = instr_access_count + (instr_miss_count * MISS_WEIGHT);
+    uint32_t t_score = total_access_count + (total_miss_count * MISS_WEIGHT);
+
+    if (t_score == 0) return;
+
+    uint32_t percent = (i_score * 100) / t_score;
+
+    if (global_use_irrip) {
+        if (percent < TURN_OFF_THRESH) global_use_irrip = false;
+    } else {
+        if (percent >= TURN_ON_THRESH) global_use_irrip = true;
+    }
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+        }
+    }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    bool use_irrip = global_use_irrip && !is_leader_set(set);
+
+    while (1)
+    {
+        if (use_irrip) {
+            for (int i=0; i<L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction)
+                    return i;
+            }
+        }
+
+        for (int i=0; i<L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV)
+                return i;
+        }
+
+        for (int i=0; i<L2C_WAY; i++) {
+            l2_rrpv[set][i]++;
+        }
+    }
+
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else if (type == LOAD_TRANSLATION)
+	TYPE_NAME = "L_TN";
+    else if (type == PREFETCH_TRANSLATION)
+	TYPE_NAME = "P_TN";
+    else if (type == TRANSLATION_FROM_L1D)
+	TYPE_NAME = "TN_L1D";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // updating leader set statistics, only LOAD requests are counted
+    if (is_leader_set(set) && type == LOAD) {
+        total_access_count++;
+        if (isInstruction) instr_access_count++;
+
+        if (!hit) {
+            total_miss_count++;
+            if (isInstruction) instr_miss_count++;
+        }
+        
+        evaluate_phase();
+
+        // halve counter regularly
+        if ((total_access_count + total_miss_count) >= EPOCH_LIMIT) {
+            total_access_count /= 2;
+            total_miss_count /= 2;
+            instr_access_count /= 2;
+            instr_miss_count /= 2;
+        }
+    }
+
+    bool use_irrip = global_use_irrip && !is_leader_set(set);
+
+    if (hit) {
+        if (use_irrip) {
+            if (type == WRITEBACK)
+                return;
+            if (isInstruction) {
+                l2_rrpv[set][way] = 0;  
+            } else {
+                if (irrip_percent(irrip_rng) < DATA_PROMOTE_PERCENT)
+                    l2_rrpv[set][way] = 0;  
+            }
+        } else {
+            l2_rrpv[set][way] = 0;
+        }
+    } 
+    else { 
+        if (use_irrip) {
+            l2_rrpv[set][way] = isInstruction ? (maxRRPV - 1) : maxRRPV;
+        } else {
+            l2_rrpv[set][way] = maxRRPV - 1;
+        }
+    }
+}
+
+void CACHE::l2c_replacement_final_stats(){
+}

@@ -1,24 +1,233 @@
 #include "cache.h"
+#include <iostream>
+
+//to prevent name collisions of global variables
+namespace {
+    // hyperparams
+
+    // Instruction Pointer Table
+    #define IPT_SETS 64
+    #define IPT_WAYS 4
+    
+    #define PHT_SIZE 1024      //Pattern History Table    
+    
+    #define RECENT_PF_SIZE 512     //512-entry circular queue to remember which cache lines we recently prefetched
+    #define EPOCH_ISSUES 256       //Evaluates prefetcher's accuracy every 256 issued prefetches
+
+    // structures
+    struct SPP_IPT_ENTRY {
+        uint64_t tag;             
+        uint64_t last_cl_addr;    
+        int64_t prev_stride;      
+        int64_t last_stride;      
+        int stride_conf;          
+        uint32_t lru;             
+        bool valid;
+    };
+
+    struct SPP_PHT_ENTRY {
+        int64_t next_stride;
+        int conf;
+    };
+
+    // states
+
+    SPP_IPT_ENTRY ipt[IPT_SETS][IPT_WAYS];
+    SPP_PHT_ENTRY pht[PHT_SIZE];
+
+    int current_prefetch_degree = 2; 
+    
+    // Throttling counters
+    uint32_t total_pf_issued = 0;
+    uint32_t useful_pf_hits = 0;
+
+    // GLOBAL counters 
+    uint64_t global_pf_issued = 0;
+    uint64_t global_pf_useful = 0;
+
+    uint64_t pf_queue[RECENT_PF_SIZE];
+    uint32_t pf_queue_head = 0;
+
+    // Helper Functions
+    uint32_t hash_ip(uint64_t ip) {
+        return ((ip >> 2) ^ (ip >> 5)) % IPT_SETS;
+    }
+
+    uint32_t hash_stride(int64_t stride) {
+        return (stride < 0) ? ((-stride) | 0x200) : stride;
+    }
+
+    void record_prefetch(uint64_t cl_addr) {
+        pf_queue[pf_queue_head] = cl_addr;
+        pf_queue_head = (pf_queue_head + 1) % RECENT_PF_SIZE;
+    }
+
+    bool check_and_clear_useful(uint64_t cl_addr) {
+        for (int i = 0; i < RECENT_PF_SIZE; i++) {
+            if (pf_queue[i] == cl_addr) {
+                pf_queue[i] = 0; 
+                return true;
+            }
+        }
+        return false;
+    }
+}
 
 
-void CACHE::l1d_prefetcher_initialize() 
-{
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+void CACHE::l1d_prefetcher_initialize() {
+
+    for (int i = 0; i < IPT_SETS; i++) {
+        for (int j = 0; j < IPT_WAYS; j++) {
+            ipt[i][j].valid = false;
+            ipt[i][j].lru = j;
+            ipt[i][j].stride_conf = 0;
+        }
+    }
+    for (int i = 0; i < PHT_SIZE; i++) {
+        pht[i].next_stride = 0;
+        pht[i].conf = 0;
+    }
+    for (int i = 0; i < RECENT_PF_SIZE; i++) {
+        pf_queue[i] = 0;
+    }
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    //  Accuracy Tracking 
+    if (check_and_clear_useful(cl_addr)) {
+        useful_pf_hits++;
+        global_pf_useful++; 
+    }
+
+    // Throttling logic
+    if (total_pf_issued >= EPOCH_ISSUES) {
+        int accuracy = (useful_pf_hits * 100) / total_pf_issued;
+        
+        if (accuracy >= 75) current_prefetch_degree = 4;
+        else if (accuracy >= 45) current_prefetch_degree = 3;
+        else if (accuracy >= 20) current_prefetch_degree = 2;
+        else current_prefetch_degree = 1;
+        
+        total_pf_issued = 0;
+        useful_pf_hits = 0;
+    }
+
+    // IP Table (IPT) Lookup 
+    //finds out which set
+    uint32_t set = hash_ip(ip);
+    int way = -1;
+    
+    //checks the 4 ways to see if we are already tracking this instruction. If not find LRU entry in that set, evict it and start tracking this IP
+    for (int i = 0; i < IPT_WAYS; i++) {
+        if (ipt[set][i].valid && ipt[set][i].tag == ip) {
+            way = i;
+            break;
+        }
+    }
+
+    if (way == -1) {
+        for (int i = 0; i < IPT_WAYS; i++) {
+            if (ipt[set][i].lru == (IPT_WAYS - 1)) {
+                way = i;
+                break;
+            }
+        }
+        
+        ipt[set][way].valid = true;
+        ipt[set][way].tag = ip;
+        ipt[set][way].last_cl_addr = cl_addr;
+        ipt[set][way].prev_stride = 0;
+        ipt[set][way].last_stride = 0;
+        ipt[set][way].stride_conf = 0;
+        
+        for (int i = 0; i < IPT_WAYS; i++) {
+            if (ipt[set][i].lru < ipt[set][way].lru) ipt[set][i].lru++;
+        }
+        ipt[set][way].lru = 0;
+        return; 
+    }
+
+    // Update LRU on hit
+    for (int i = 0; i < IPT_WAYS; i++) {
+        if (ipt[set][i].lru < ipt[set][way].lru) ipt[set][i].lru++;
+    }
+    ipt[set][way].lru = 0;
+
+    // Pattern Training Phase
+    int64_t stride = cl_addr - ipt[set][way].last_cl_addr;
+    if (stride == 0) return; 
+
+    // Uniform Stride Training
+    if (stride == ipt[set][way].last_stride) {
+        if (ipt[set][way].stride_conf < 3) ipt[set][way].stride_conf++;
+    } else {
+        ipt[set][way].stride_conf = 0; 
+    }
+
+    // Non-Uniform Stride Training
+    //uses last 2 strides to predict next one
+    uint32_t pht_idx = ((hash_stride(ipt[set][way].prev_stride) << 4) ^ hash_stride(ipt[set][way].last_stride)) & (PHT_SIZE - 1);
+    
+    if (pht[pht_idx].next_stride == stride) {
+        if (pht[pht_idx].conf < 3) pht[pht_idx].conf++;
+    } else {
+        if (pht[pht_idx].conf > 0) pht[pht_idx].conf--;
+        if (pht[pht_idx].conf == 0) { 
+            pht[pht_idx].next_stride = stride; 
+            pht[pht_idx].conf = 1;
+        }
+    }
+
+    ipt[set][way].prev_stride = ipt[set][way].last_stride;
+    ipt[set][way].last_stride = stride;
+    ipt[set][way].last_cl_addr = cl_addr;
+
+    // Prefetch 
+    int64_t temp_prev = ipt[set][way].prev_stride;
+    int64_t temp_last = ipt[set][way].last_stride;
+    uint64_t curr_pf_addr = cl_addr;
+
+    for (int i = 0; i < current_prefetch_degree; i++) {
+        int64_t pred_stride = 0;
+
+        if (ipt[set][way].stride_conf >= 2) {
+            pred_stride = temp_last; 
+        } else {
+            uint32_t temp_pht_idx = ((hash_stride(temp_prev) << 4) ^ hash_stride(temp_last)) & (PHT_SIZE - 1);
+            if (pht[temp_pht_idx].conf > 0) {
+                pred_stride = pht[temp_pht_idx].next_stride; 
+            } else {
+                break; 
+            }
+        }
+
+        if (pred_stride == 0) break;
+
+        curr_pf_addr += pred_stride;
+        uint64_t pf_address = curr_pf_addr << LOG2_BLOCK_SIZE;
+
+        //page boundary check
+        if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) break;
+        //MSHR check
+        int fill_level = (MSHR.occupancy < (MSHR.SIZE >> 1)) ? FILL_L1 : FILL_L2;
+        
+        prefetch_line(ip, addr, pf_address, fill_level, 0);
+
+        record_prefetch(curr_pf_addr);
+        
+        total_pf_issued++;
+        global_pf_issued++; 
+
+        temp_prev = temp_last;
+        temp_last = pred_stride;
+    }
 }
 
-void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
-{
-	return; //metadata_in;
-}
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in) {}
 
-void CACHE::l1d_prefetcher_final_stats()
-{
-
+void CACHE::l1d_prefetcher_final_stats() {
+    
 }
