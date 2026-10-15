@@ -1,215 +1,88 @@
 #include "cache.h"
 #include <random>
-
-// Dynamic I-RRIP with one leader group (the spec's hint).
-//   RRIP leader sets : always SRRIP (insert at RRPV 2, hit -> RRPV 0, evict first line at maxRRPV)
-//   follower sets    : I-RRIP if the metric of the RRIP leaders is more than T, else SRRIP
-// There are no I-RRIP leader sets.
-
-// ================= design options =================
-// Metric of the RRIP leader sets
-#define M_MISS_RATE 1   // instr misses / instr accesses
-#define M_SPEC      2   // (instr accesses + instr misses) / (total accesses + total misses)
-
-// ----- selected options -----
-#define METRIC_OPTION   M_MISS_RATE
-
-// ----- parameters -----
-#define NUM_LEADER_SETS 64          // RRIP leader sets
-#define T               0.25        // metric > T: followers use I-RRIP, metric < T: followers use SRRIP
-#define EPOCH_N         32          // leader LOAD accesses in each epoch
-#define KEEP            0.5         // counters are multiplied by KEEP after each decision (0.5 = halve, 0 = reset)
-
-// policy of the follower sets at the start of the simulation
-#define POLICY_RRIP  0
-#define POLICY_IRRIP 1
-#define INITIAL_FOLLOWER_POLICY POLICY_RRIP
-// ==================================================
+#include <iostream>
 
 #define maxRRPV 3
 #define DATA_PROMOTE_PERCENT 8
+
+// 00 0011 1111 -- 16 leader sets 
+#define LEADER_SET_MASK 0x3F 
+
+#define TURN_ON_THRESH 20
+#define TURN_OFF_THRESH 15
+
+#define MISS_WEIGHT 1
+
+#define EPOCH_LIMIT 4096     
+
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 
-// private fixed-seed random number generator for probabilistic data promotion.
-// It is separate from rand(), because page_table_walker.cc uses rand() to map pages:
-// sharing it would change the physical memory layout and not only this policy.
-static std::mt19937 irrip_rng(683);
-static std::uniform_int_distribution<int> irrip_percent(0, 99);   // uniform 0..99
+uint32_t instr_access_count = 0;
+uint32_t instr_miss_count = 0;
+uint32_t total_access_count = 0;
+uint32_t total_miss_count = 0;
 
-// ---------------- leader sets ----------------
-// the first set in each block of LEADER_GAP sets is an RRIP leader
-#define LEADER_GAP (L2C_SET / NUM_LEADER_SETS)
+bool global_use_irrip = false;
 
-static bool is_leader(uint32_t set)
-{
-    return (set % LEADER_GAP) == 0;
+std::mt19937 irrip_rng(683);
+std::uniform_int_distribution<int> irrip_percent(0, 99);
+
+bool is_leader_set(uint32_t set) {
+    return (set & LEADER_SET_MASK) == 0;
 }
 
-// ---------------- leader set counters ----------------
-// Only LOAD requests are counted, the same as the L2C INSTRUCTION / DATA LOAD MPKI
-// in main.cc (roi_miss[cpu][0], roi_instr_miss[cpu][0]): no RFO, writeback or translation requests.
-static double instr_access, instr_miss;       // epoch counters (multiplied by KEEP, so double)
-static double data_access,  data_miss;
-static uint64_t epoch_accesses;               // leader LOAD accesses in the current epoch
+void evaluate_phase() {
+    // giving more weight to misses 
+    uint32_t i_score = instr_access_count + (instr_miss_count * MISS_WEIGHT);
+    uint32_t t_score = total_access_count + (total_miss_count * MISS_WEIGHT);
 
-static int follower_policy = INITIAL_FOLLOWER_POLICY;
+    if (t_score == 0) return;
 
-// statistics for the whole run (never halved or reset)
-static uint64_t total_instr_access, total_instr_miss, total_data_access, total_data_miss;
-static uint64_t num_decisions, num_switches;
-static uint64_t follower_load_access[2];      // follower LOAD accesses while in RRIP / I-RRIP mode
+    uint32_t percent = (i_score * 100) / t_score;
 
-// ---------------- SRRIP rules ----------------
-static uint32_t rrip_find_victim(uint32_t set)
-{
-    // evict the first line at maxRRPV
-    while (1)
-    {
-        for (int i=0; i<L2C_WAY; i++)
-            if (l2_rrpv[set][i] == maxRRPV)
-                return i;
-
-        // no line at maxRRPV: age all lines
-        for (int i=0; i<L2C_WAY; i++)
-            l2_rrpv[set][i]++;
-    }
-}
-
-static void rrip_update(uint32_t set, uint32_t way, uint8_t hit)
-{
-    if (hit)
-        l2_rrpv[set][way] = 0;              // hit priority
-    else
-        l2_rrpv[set][way] = maxRRPV-1;      // insert at RRPV 2
-}
-
-// ---------------- I-RRIP rules (Task 2A) ----------------
-static uint32_t irrip_find_victim(uint32_t set, const BLOCK *current_set)
-{
-    // among the lines at maxRRPV, evict a data line first
-    while (1)
-    {
-        // pass 1: data line at maxRRPV
-        for (int i=0; i<L2C_WAY; i++)
-            if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction)
-                return i;
-
-        // pass 2: any line at maxRRPV (only instruction lines are left)
-        for (int i=0; i<L2C_WAY; i++)
-            if (l2_rrpv[set][i] == maxRRPV)
-                return i;
-
-        // no line at maxRRPV: age all lines (same as SRRIP)
-        for (int i=0; i<L2C_WAY; i++)
-            l2_rrpv[set][i]++;
-    }
-}
-
-static void irrip_update(uint32_t set, uint32_t way, uint32_t type, uint8_t hit, uint8_t isInstruction)
-{
-    if (hit) {
-        // a writeback hit is not a demand reuse: keep the RRPV
-        if (type == WRITEBACK)
-            return;
-
-        if (isInstruction)
-            l2_rrpv[set][way] = 0;      // instruction hit: full protection
-        else
-        {
-            // data hit: promote with a small probability, so that only data lines
-            // with many hits (frequent reuse) are likely to get full protection
-            if (irrip_percent(irrip_rng) < DATA_PROMOTE_PERCENT)
-                l2_rrpv[set][way] = 0;
-        }
-    }
-    else {
-        // fill: instruction lines at RRPV 2, data lines at maxRRPV (next victims if not reused)
-        l2_rrpv[set][way] = isInstruction ? maxRRPV-1 : maxRRPV;
-    }
-}
-
-// ---------------- decision ----------------
-// metric of the RRIP leader sets
-static double leader_metric()
-{
-#if METRIC_OPTION == M_MISS_RATE
-    return (instr_access > 0) ? instr_miss / instr_access : 0;
-#elif METRIC_OPTION == M_SPEC
-    double total = instr_access + data_access + instr_miss + data_miss;
-    return (total > 0) ? (instr_access + instr_miss) / total : 0;
-#else
-#error "unknown METRIC_OPTION"
-#endif
-}
-
-// end of an epoch: compare the metric with T, then decay the counters
-static void end_epoch()
-{
-    double m = leader_metric();
-    int selected = follower_policy;
-    if (m > T)
-        selected = POLICY_IRRIP;
-    else if (m < T)
-        selected = POLICY_RRIP;
-
-    num_decisions++;
-    if (selected != follower_policy) {
-        follower_policy = selected;
-        num_switches++;
-    }
-
-    instr_access *= KEEP;  instr_miss *= KEEP;
-    data_access  *= KEEP;  data_miss  *= KEEP;
-    epoch_accesses = 0;
-}
-
-// count one LOAD access of a leader set
-static void count_leader_load(uint8_t hit, uint8_t isInstruction)
-{
-    // A fill (hit == 0) occurs only after a miss, so each fill is one miss.
-    if (isInstruction) {
-        instr_access++;            total_instr_access++;
-        if (!hit) { instr_miss++;  total_instr_miss++; }
+    if (global_use_irrip) {
+        if (percent < TURN_OFF_THRESH) global_use_irrip = false;
     } else {
-        data_access++;             total_data_access++;
-        if (!hit) { data_miss++;   total_data_miss++; }
+        if (percent >= TURN_ON_THRESH) global_use_irrip = true;
     }
-
-    if (++epoch_accesses >= EPOCH_N)
-        end_epoch();
 }
 
-// initialize replacement state
 void CACHE::l2c_initialize_replacement()
 {
-    cout << "Initialize dynamic IRRIP (one leader group) state for L2C: metric " << METRIC_OPTION
-         << ", T " << T << ", " << NUM_LEADER_SETS << " RRIP leader sets, EPOCH_N " << EPOCH_N
-         << ", KEEP " << KEEP << endl;
-
     for (int i=0; i<L2C_SET; i++) {
         for (int j=0; j<L2C_WAY; j++) {
             l2_rrpv[i][j] = maxRRPV;
         }
     }
-
-    instr_access = instr_miss = data_access = data_miss = 0;
-    total_instr_access = total_instr_miss = total_data_access = total_data_miss = 0;
-    epoch_accesses = 0;
-    num_decisions = num_switches = 0;
-    follower_load_access[0] = follower_load_access[1] = 0;
-    follower_policy = INITIAL_FOLLOWER_POLICY;
 }
 
-// find replacement victim
 uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
-    if (is_leader(set) || follower_policy == POLICY_RRIP)
-        return rrip_find_victim(set);
+    bool use_irrip = global_use_irrip && !is_leader_set(set);
 
-    return irrip_find_victim(set, current_set);
+    while (1)
+    {
+        if (use_irrip) {
+            for (int i=0; i<L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction)
+                    return i;
+            }
+        }
+
+        for (int i=0; i<L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV)
+                return i;
+        }
+
+        for (int i=0; i<L2C_WAY; i++) {
+            l2_rrpv[set][i]++;
+        }
+    }
+
+    assert(0);
+    return 0;
 }
 
-// called on every cache hit and cache fill
 void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
 {
     string TYPE_NAME;
@@ -238,33 +111,51 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     if ((type == WRITEBACK) && ip)
         assert(0);
 
-    // uncomment this line to see the L2C accesses
-    // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
-    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+    // updating leader set statistics, only LOAD requests are counted
+    if (is_leader_set(set) && type == LOAD) {
+        total_access_count++;
+        if (isInstruction) instr_access_count++;
 
-    bool leader = is_leader(set);
+        if (!hit) {
+            total_miss_count++;
+            if (isInstruction) instr_miss_count++;
+        }
+        
+        evaluate_phase();
 
-    if (type == LOAD) {
-        if (leader)
-            count_leader_load(hit, isInstruction);
-        else
-            follower_load_access[follower_policy]++;
+        // halve counter regularly
+        if ((total_access_count + total_miss_count) >= EPOCH_LIMIT) {
+            total_access_count /= 2;
+            total_miss_count /= 2;
+            instr_access_count /= 2;
+            instr_miss_count /= 2;
+        }
     }
 
-    // leader sets always use SRRIP, follower sets use the selected policy
-    if (leader || follower_policy == POLICY_RRIP)
-        rrip_update(set, way, hit);
-    else
-        irrip_update(set, way, type, hit, isInstruction);
+    bool use_irrip = global_use_irrip && !is_leader_set(set);
+
+    if (hit) {
+        if (use_irrip) {
+            if (type == WRITEBACK)
+                return;
+            if (isInstruction) {
+                l2_rrpv[set][way] = 0;  
+            } else {
+                if (irrip_percent(irrip_rng) < DATA_PROMOTE_PERCENT)
+                    l2_rrpv[set][way] = 0;  
+            }
+        } else {
+            l2_rrpv[set][way] = 0;
+        }
+    } 
+    else { 
+        if (use_irrip) {
+            l2_rrpv[set][way] = isInstruction ? (maxRRPV - 1) : maxRRPV;
+        } else {
+            l2_rrpv[set][way] = maxRRPV - 1;
+        }
+    }
 }
 
-// use this function to print out your own stats at the end of simulation
-void CACHE::l2c_replacement_final_stats()
-{
-    cout << "L2C RRIP leaders: instr access " << total_instr_access << " instr miss " << total_instr_miss
-         << " data access " << total_data_access << " data miss " << total_data_miss << endl;
-    uint64_t fol = follower_load_access[0] + follower_load_access[1];
-    cout << "L2C dynamic IRRIP: decisions " << num_decisions << " switches " << num_switches
-         << " follower LOAD accesses in I-RRIP mode " << follower_load_access[POLICY_IRRIP]
-         << " (" << (fol ? 100.0 * follower_load_access[POLICY_IRRIP] / fol : 0) << "%)" << endl;
+void CACHE::l2c_replacement_final_stats(){
 }
