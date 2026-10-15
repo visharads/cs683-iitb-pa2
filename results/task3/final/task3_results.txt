@@ -1,0 +1,34 @@
+Task 3: SPP-aware dynamic I-RRIP (replacement/dyn_irrip_task3.l2c_repl) with the SPP L1D prefetcher
+25M warmup + 25M simulation instructions per trace.
+Speedup = IPC / IPC of RRIP (SRRIP) without a prefetcher, on the same trace.
+Accuracy = ChampSim L1D 'USEFUL LOAD PREFETCHES ... ACCURACY' (useful / issued to lower level).
+Coverage = (L1D load misses of RRIP without a prefetcher - L1D load misses with SPP) / L1D load misses of RRIP without a prefetcher.
+Mean: geometric mean for IPC, speedup and MPKI; arithmetic mean for accuracy and coverage.
+
+== trace1 ==
+Policy                          IPC       Speedup over RRIP  L1D prefetch accuracy (%)  L1D prefetch coverage (%)  L1D load MPKI  L2C load MPKI  L2C instruction load MPKI  L2C data load MPKI
+RRIP (no prefetcher)            0.232213  1.0000             -                          -                          10.6785        17.6189        10.5632                    7.0557            
+Dynamic I-RRIP (no prefetcher)  0.233633  1.0061             -                          -                          10.6800        18.8272        8.9717                     9.8556            
+SPP + RRIP                      0.232406  1.0008             39.98                      13.07                      9.2831         16.5886        10.6793                    5.9094            
+SPP + Task 3                    0.234903  1.0116             39.45                      12.76                      9.3159         17.3366        8.9540                     8.3825            
+
+== trace2 ==
+Policy                          IPC       Speedup over RRIP  L1D prefetch accuracy (%)  L1D prefetch coverage (%)  L1D load MPKI  L2C load MPKI  L2C instruction load MPKI  L2C data load MPKI
+RRIP (no prefetcher)            0.251848  1.0000             -                          -                          13.5342        26.0120        17.9797                    8.0323            
+Dynamic I-RRIP (no prefetcher)  0.263611  1.0467             -                          -                          13.5444        19.6052        7.9487                     11.6566           
+SPP + RRIP                      0.255131  1.0130             33.64                      5.14                       12.8392        25.8113        18.5398                    7.2715            
+SPP + Task 3                    0.268583  1.0664             33.45                      5.06                       12.8492        18.6650        7.9080                     10.7569           
+
+== trace3 ==
+Policy                          IPC       Speedup over RRIP  L1D prefetch accuracy (%)  L1D prefetch coverage (%)  L1D load MPKI  L2C load MPKI  L2C instruction load MPKI  L2C data load MPKI
+RRIP (no prefetcher)            0.381574  1.0000             -                          -                          3.4034         4.0368         1.1904                     2.8464            
+Dynamic I-RRIP (no prefetcher)  0.385084  1.0092             -                          -                          3.4038         3.8906         0.6543                     3.2364            
+SPP + RRIP                      0.389314  1.0203             26.22                      17.56                      2.8056         3.2200         1.2274                     1.9927            
+SPP + Task 3                    0.393398  1.0310             26.19                      17.57                      2.8055         3.0591         0.6566                     2.4025            
+
+== Mean over the 3 traces ==
+Policy                          IPC       Speedup over RRIP  L1D prefetch accuracy (%)  L1D prefetch coverage (%)  L1D load MPKI  L2C load MPKI  L2C instruction load MPKI  L2C data load MPKI
+RRIP (no prefetcher)            0.281536  1.0000             -                          -                          7.8938         12.2762        6.0920                     5.4437            
+Dynamic I-RRIP (no prefetcher)  0.287310  1.0205             -                          -                          7.8965         11.2822        3.6001                     7.1907            
+SPP + RRIP                      0.284732  1.0114             33.28                      11.92                      6.9410         11.1300        6.2403                     4.4076            
+SPP + Task 3                    0.291698  1.0361             33.03                      11.80                      6.9508         9.9662         3.5957                     6.0059            
