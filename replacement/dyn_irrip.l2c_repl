@@ -2,37 +2,43 @@
 #include <random>
 #include <iostream>
 
+// hyperparms
+
 #define maxRRPV 3
 #define DATA_PROMOTE_PERCENT 8
 
-// 00 0011 1111 -- 16 leader sets 
-#define LEADER_SET_MASK 0x3F 
 
-#define TURN_ON_THRESH 20
-#define TURN_OFF_THRESH 15
+#define LEADER_SET_MASK 0x3F  //1 out of every 64 sets acts as leader sets
+#define TURN_ON_THRESH 20     //I-RRIP turns on when it reaches TURN_ON_THRES
+#define TURN_OFF_THRESH 15    //I-RRIP turns off when it reaches TURN_OFF_THRES
 
 #define MISS_WEIGHT 1
 
+//Sampling counters decay
 #define EPOCH_LIMIT 4096     
 
-uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+// states
+uint32_t l2_rrpv[L2C_SET][L2C_WAY]; //2-bit rrip bits
+bool is_prefetch[L2C_SET][L2C_WAY]; // Metadata to track prefetch lines laterally
 
 uint32_t instr_access_count = 0;
 uint32_t instr_miss_count = 0;
 uint32_t total_access_count = 0;
 uint32_t total_miss_count = 0;
 
-bool global_use_irrip = false;
+static bool global_use_irrip = false;
+static uint64_t num_switches = 0;   // number of mode changes (for the final stats)
 
-std::mt19937 irrip_rng(683);
-std::uniform_int_distribution<int> irrip_percent(0, 99);
+static std::mt19937 irrip_rng(683);
+static std::uniform_int_distribution<int> irrip_percent(0, 99);
 
-bool is_leader_set(uint32_t set) {
+// helper functions
+inline bool is_leader_set(uint32_t set) {
     return (set & LEADER_SET_MASK) == 0;
 }
 
-void evaluate_phase() {
-    // giving more weight to misses 
+//decides to turn I-RRIP on or OFF
+inline void evaluate_phase() {
     uint32_t i_score = instr_access_count + (instr_miss_count * MISS_WEIGHT);
     uint32_t t_score = total_access_count + (total_miss_count * MISS_WEIGHT);
 
@@ -41,17 +47,17 @@ void evaluate_phase() {
     uint32_t percent = (i_score * 100) / t_score;
 
     if (global_use_irrip) {
-        if (percent < TURN_OFF_THRESH) global_use_irrip = false;
+        if (percent < TURN_OFF_THRESH) { global_use_irrip = false; num_switches++; }
     } else {
-        if (percent >= TURN_ON_THRESH) global_use_irrip = true;
+        if (percent >= TURN_ON_THRESH) { global_use_irrip = true; num_switches++; }
     }
 }
 
-void CACHE::l2c_initialize_replacement()
-{
+void CACHE::l2c_initialize_replacement(){
     for (int i=0; i<L2C_SET; i++) {
         for (int j=0; j<L2C_WAY; j++) {
             l2_rrpv[i][j] = maxRRPV;
+            is_prefetch[i][j] = false;
         }
     }
 }
@@ -63,56 +69,49 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
     while (1)
     {
         if (use_irrip) {
+            // I-RRIP Pass 1: Evict dead demand DATA lines first
             for (int i=0; i<L2C_WAY; i++) {
-                if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction)
+                if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction && !is_prefetch[set][i])
+                    return i;
+            }
+            // I-RRIP Pass 2: Evict PREFETCHED data lines next
+            for (int i=0; i<L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction && is_prefetch[set][i])
+                    return i;
+            }
+        } else {
+            // SRRIP Pass 1: Evict non-prefetches first
+            for (int i=0; i<L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && !is_prefetch[set][i])
+                    return i;
+            }
+            // SRRIP Pass 2: Evict prefetches
+            for (int i=0; i<L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && is_prefetch[set][i])
                     return i;
             }
         }
 
+        // Final Pass: Any line at maxRRPV (This is where instructions are evicted)
         for (int i=0; i<L2C_WAY; i++) {
             if (l2_rrpv[set][i] == maxRRPV)
                 return i;
         }
 
+        // Age all lines
         for (int i=0; i<L2C_WAY; i++) {
             l2_rrpv[set][i]++;
         }
     }
-
     assert(0);
     return 0;
 }
 
 void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
 {
-    string TYPE_NAME;
-    if (type == LOAD)
-        TYPE_NAME = "LOAD";
-    else if (type == RFO)
-        TYPE_NAME = "RFO";
-    else if (type == PREFETCH)
-        TYPE_NAME = "PF";
-    else if (type == WRITEBACK)
-        TYPE_NAME = "WB";
-    else if (type == LOAD_TRANSLATION)
-	TYPE_NAME = "L_TN";
-    else if (type == PREFETCH_TRANSLATION)
-	TYPE_NAME = "P_TN";
-    else if (type == TRANSLATION_FROM_L1D)
-	TYPE_NAME = "TN_L1D";
-    else
-        assert(0);
-
-    if (hit)
-        TYPE_NAME += "_HIT";
-    else
-        TYPE_NAME += "_MISS";
-
-    if ((type == WRITEBACK) && ip)
-        assert(0);
-
-    // updating leader set statistics, only LOAD requests are counted
-    if (is_leader_set(set) && type == LOAD) {
+    // Tracking Leader Sets 
+    // Exclude PREFETCH and WRITEBACK from tracking
+    if (is_leader_set(set) && type != PREFETCH && type != WRITEBACK) {
         total_access_count++;
         if (isInstruction) instr_access_count++;
 
@@ -121,23 +120,25 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
             if (isInstruction) instr_miss_count++;
         }
         
-        evaluate_phase();
-
-        // halve counter regularly
+        evaluate_phase(); 
+        
+        //exponentially decay old history
         if ((total_access_count + total_miss_count) >= EPOCH_LIMIT) {
-            total_access_count /= 2;
-            total_miss_count /= 2;
-            instr_access_count /= 2;
-            instr_miss_count /= 2;
+            total_access_count >>= 1;
+            total_miss_count >>= 1;
+            instr_access_count >>= 1;
+            instr_miss_count >>= 1;
         }
     }
 
     bool use_irrip = global_use_irrip && !is_leader_set(set);
 
+    // Update State
     if (hit) {
+        if (type == WRITEBACK || type == PREFETCH) return; // Do not promote
+
+        // Demand Hit Promotion
         if (use_irrip) {
-            if (type == WRITEBACK)
-                return;
             if (isInstruction) {
                 l2_rrpv[set][way] = 0;  
             } else {
@@ -147,9 +148,20 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         } else {
             l2_rrpv[set][way] = 0;
         }
+        
+        // demand hit turns a prefetch into a demand line
+        is_prefetch[set][way] = false; 
     } 
     else { 
-        if (use_irrip) {
+        // Track if this new line is a prefetch
+        is_prefetch[set][way] = (type == PREFETCH);
+
+        // Insertion Policy
+        if (type == PREFETCH) {
+            // Reverted to maxRRPV (3) to prevent crowding out instruction lines
+            l2_rrpv[set][way] = maxRRPV; 
+        }
+        else if (use_irrip) {
             l2_rrpv[set][way] = isInstruction ? (maxRRPV - 1) : maxRRPV;
         } else {
             l2_rrpv[set][way] = maxRRPV - 1;
